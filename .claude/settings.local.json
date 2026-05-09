@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "Bash(pnpm --version)",
-      "Bash(docker --version)"
+      "Bash(docker --version)",
+      "Bash(pnpm --filter @aof/server db:generate)",
+      "Bash(pnpm install *)",
+      "Bash(pnpm typecheck *)",
+      "Bash(pnpm lint *)",
+      "Bash(pnpm exec *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(grep -E \"_SW\\\\.png$\")"
     ]
   }
 }

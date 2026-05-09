@@ -9,6 +9,7 @@ export interface WorldState {
   workers: Worker[];
   tech: TechProgress;
   modifiedChunks: ChunkData[];
+  clearedTiles: Record<string, true>;
 }
 
 export interface ChunkData {
