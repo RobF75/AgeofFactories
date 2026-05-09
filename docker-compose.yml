@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: aof-postgres
+    environment:
+      POSTGRES_USER: aof
+      POSTGRES_PASSWORD: aof
+      POSTGRES_DB: aof
+    ports:
+      - '5432:5432'
+    volumes:
+      - aof-pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  aof-pgdata:
