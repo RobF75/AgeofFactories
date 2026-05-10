@@ -1,28 +1,29 @@
+import { BALANCE, TERRAIN_HARVEST, defaultTileYield } from '../data/balance.js';
 import { FACTORY_TYPES } from '../data/factoryTypes.js';
-import { foodForTier } from '../data/foodTiers.js';
-import { MACHINE_TYPES } from '../data/machineTypes.js';
-import type { FactoryInstance } from '../types/factory.js';
+import { acceptedFoodsForTier, foodForTier, isFoodItem, isPromotionFood } from '../data/foodTiers.js';
+import { MACHINE_TYPES, machineStations } from '../data/machineTypes.js';
+import type { FactoryInstance, FactoryType } from '../types/factory.js';
 import type { Worker } from '../types/worker.js';
 import { HUNGER_THRESHOLD, MAX_ENERGY } from '../types/worker.js';
 import type { WorldState } from '../types/world.js';
-import { bayWorldPos, findBay, findMachine } from '../world/factoryLayout.js';
+import { bayWorldPos, findBay } from '../world/factoryLayout.js';
 import {
   WORLD_GRID_TILES,
   findNearestFactorySource,
   findNearestFoodSource,
-  findNearestTree,
+  findNearestTerrainResource,
+  getTerrainAt,
 } from '../world/terrain.js';
 
-const INNER_SPEED = 0.15;
-const OUTER_SPEED = 0.1;
-const AT_BAY_TICKS = 5;
-const AT_MACHINE_TICKS = 20;
-const HARVEST_TICKS = 20;
-const DELIVER_TICKS = 5;
-const EAT_DURATION_TICKS = 20;
-const ENERGY_DECAY_PER_TICK = 1;
-const FARM_PRODUCTION_PERIOD = 100;
-const FACTORY_FOOD_THRESHOLD = 3;
+const { innerSpeed: INNER_SPEED, outerSpeed: OUTER_SPEED, atBayTicks: AT_BAY_TICKS, atMachineTicks: AT_MACHINE_TICKS, harvestTicks: HARVEST_TICKS, deliverTicks: DELIVER_TICKS } = BALANCE.movement;
+
+/** Speed multiplier from a worker's last meal. Defaults to food (1.0) if never fed. */
+function speedMultiplier(w: Worker): number {
+  return BALANCE.foodSpeed[w.lastEaten ?? 'food'] ?? 1;
+}
+const { eatDurationTicks: EAT_DURATION_TICKS, energyDecayPerTick: ENERGY_DECAY_PER_TICK } = BALANCE.worker;
+const FARM_GRAIN_PERIOD = BALANCE.farm.grainPeriodTicks;
+const FACTORY_FOOD_THRESHOLD = BALANCE.factory.foodThreshold;
 
 interface Vec2 {
   x: number;
@@ -33,10 +34,73 @@ interface FactoryDelta {
   factoryId: string;
   input?: Record<string, number>;
   output?: Record<string, number>;
-  construction?: number;
-  foodBuffer?: number;
+  /** Construction material delivered, keyed by item type. */
+  constructionDelivered?: Record<string, number>;
+  /** Upgrade material delivered (factory.pendingUpgrade), keyed by item type. */
+  upgradeDelivered?: Record<string, number>;
+  /** Per-item delta to add (positive) or subtract (negative) from the factory's food pantry. */
+  foodInventoryDelta?: Record<string, number>;
+  /** Site-clearing tile (yield set to 0 when tile is cleared for building). */
   siteClearedTile?: { x: number; y: number };
+  /** Tile harvested from terrain (yield decremented by 1). */
+  terrainHarvested?: { x: number; y: number };
   demolishProgress?: number;
+}
+
+/** Returns construction items still needed (required - delivered > 0), in declaration order. */
+function constructionShortfall(
+  factory: FactoryInstance,
+  factoryType: FactoryType | undefined,
+): { item: string; remaining: number }[] {
+  if (factory.construction.complete) return [];
+  const required = factoryType?.constructionCost?.resources;
+  if (!required) return [];
+  const out: { item: string; remaining: number }[] = [];
+  for (const [item, amt] of Object.entries(required)) {
+    const got = factory.construction.delivered[item] ?? 0;
+    if (got < amt) out.push({ item, remaining: amt - got });
+  }
+  return out;
+}
+
+function isConstructionMaterialNeeded(
+  factory: FactoryInstance,
+  factoryType: FactoryType | undefined,
+  item: string,
+): boolean {
+  if (factory.construction.complete) return false;
+  const required = factoryType?.constructionCost?.resources?.[item] ?? 0;
+  if (required <= 0) return false;
+  const got = factory.construction.delivered[item] ?? 0;
+  return got < required;
+}
+
+/** Required resources for the upgrade currently in progress (by target tier). */
+function upgradeRequired(factory: FactoryInstance): Record<string, number> {
+  if (!factory.pendingUpgrade || factory.pendingUpgrade.complete) return {};
+  // Only farms have upgrade definitions in Phase 2a.
+  if (factory.typeId !== 'farm') return {};
+  const targetTier = factory.factoryTier + 1;
+  return BALANCE.farmUpgrade[targetTier] ?? {};
+}
+
+function upgradeShortfall(factory: FactoryInstance): { item: string; remaining: number }[] {
+  if (!factory.pendingUpgrade || factory.pendingUpgrade.complete) return [];
+  const required = upgradeRequired(factory);
+  const out: { item: string; remaining: number }[] = [];
+  for (const [item, amt] of Object.entries(required)) {
+    const got = factory.pendingUpgrade.delivered[item] ?? 0;
+    if (got < amt) out.push({ item, remaining: amt - got });
+  }
+  return out;
+}
+
+function isUpgradeMaterialNeeded(factory: FactoryInstance, item: string): boolean {
+  if (!factory.pendingUpgrade || factory.pendingUpgrade.complete) return false;
+  const required = upgradeRequired(factory)[item] ?? 0;
+  if (required <= 0) return false;
+  const got = factory.pendingUpgrade.delivered[item] ?? 0;
+  return got < required;
 }
 
 interface WorkerStepResult {
@@ -97,34 +161,58 @@ function stepInnerWorker(w: Worker, factory: FactoryInstance): WorkerStepResult 
   if (!isOperational(factory)) return { worker: w, deltas: [] };
 
   const factoryType = FACTORY_TYPES[factory.typeId];
-  const inputItem = factoryType?.primaryInput?.item;
-  const outputItem = factoryType?.primaryOutput?.item;
-  if (!inputItem || !outputItem) return { worker: w, deltas: [] };
+  const inputItem = factoryType?.primaryInput?.item ?? null;
+  const outputItem = factoryType?.primaryOutput?.item ?? null;
 
   const inputBay = findBay(factory.innerLayout, 'W');
   const outputBay = findBay(factory.innerLayout, 'E');
-  const machine = findMachine(factory.innerLayout);
-  if (!inputBay || !outputBay || !machine) return { worker: w, deltas: [] };
+  if (!inputBay || !outputBay) return { worker: w, deltas: [] };
 
   const decayed = { ...w, energy: Math.max(0, w.energy - ENERGY_DECAY_PER_TICK) };
 
-  if (decayed.energy < HUNGER_THRESHOLD && (factory.foodBuffer ?? 0) >= 1) {
-    return {
-      worker: { ...decayed, energy: MAX_ENERGY, mealsEaten: decayed.mealsEaten + 1 },
-      deltas: [{ factoryId: factory.id, foodBuffer: -1 }],
-    };
+  if (decayed.energy < HUNGER_THRESHOLD) {
+    // Pick the highest-priority food the pantry has at least 1 of.
+    const priority = acceptedFoodsForTier(decayed.tier);
+    const eatable = priority.find((item) => (factory.foodInventory[item] ?? 0) >= 1);
+    if (eatable) {
+      const promoted = isPromotionFood(decayed.tier, eatable);
+      return {
+        worker: {
+          ...decayed,
+          energy: MAX_ENERGY,
+          mealsEaten: decayed.mealsEaten + 1,
+          nextTierMealsEaten: promoted
+            ? decayed.nextTierMealsEaten + 1
+            : decayed.nextTierMealsEaten,
+        },
+        deltas: [{ factoryId: factory.id, foodInventoryDelta: { [eatable]: -1 } }],
+      };
+    }
   }
 
   if (decayed.energy === 0) {
     return { worker: decayed, deltas: [] };
   }
 
+  // Pick a target machine (first operational one); used for visual movement.
+  const operationalMachines = factory.machines.filter((m) => m.status === 'operational');
+  const currentTarget = decayed.targetMachineId
+    ? operationalMachines.find((m) => m.id === decayed.targetMachineId)
+    : null;
+  const targetMachine = currentTarget ?? operationalMachines[0] ?? null;
+
   switch (decayed.phase) {
     case 'to-input': {
       const r = moveTowards(decayed.position, tileCenter(inputBay), INNER_SPEED);
       if (r.reached) {
         return {
-          worker: { ...decayed, position: r.pos, phase: 'at-input', phaseTicks: AT_BAY_TICKS },
+          worker: {
+            ...decayed,
+            position: r.pos,
+            phase: 'at-input',
+            phaseTicks: AT_BAY_TICKS,
+            targetMachineId: null,
+          },
           deltas: [],
         };
       }
@@ -134,20 +222,34 @@ function stepInnerWorker(w: Worker, factory: FactoryInstance): WorkerStepResult 
       if (decayed.phaseTicks > 0) {
         return { worker: { ...decayed, phaseTicks: decayed.phaseTicks - 1 }, deltas: [] };
       }
-      const available = (factory.inputBuffers[inputItem] ?? 0) >= 1;
-      if (!available) {
+      // Wait for at least one operational machine before walking.
+      if (!targetMachine) {
         return { worker: { ...decayed, phaseTicks: AT_BAY_TICKS }, deltas: [] };
       }
       return {
-        worker: { ...decayed, phase: 'to-machine', carrying: inputItem },
-        deltas: [{ factoryId: factory.id, input: { [inputItem]: -1 } }],
+        worker: {
+          ...decayed,
+          phase: 'to-machine',
+          carrying: inputItem,
+          targetMachineId: targetMachine.id,
+        },
+        deltas: [],
       };
     }
     case 'to-machine': {
-      const r = moveTowards(decayed.position, tileCenter(machine), INNER_SPEED);
+      if (!targetMachine) {
+        return { worker: { ...decayed, phase: 'to-input', targetMachineId: null }, deltas: [] };
+      }
+      const target = tileCenter({ x: targetMachine.innerX, y: targetMachine.innerY });
+      const r = moveTowards(decayed.position, target, INNER_SPEED);
       if (r.reached) {
         return {
-          worker: { ...decayed, position: r.pos, phase: 'at-machine', phaseTicks: AT_MACHINE_TICKS },
+          worker: {
+            ...decayed,
+            position: r.pos,
+            phase: 'at-machine',
+            phaseTicks: AT_MACHINE_TICKS,
+          },
           deltas: [],
         };
       }
@@ -170,7 +272,7 @@ function stepInnerWorker(w: Worker, factory: FactoryInstance): WorkerStepResult 
             phaseTicks: AT_BAY_TICKS,
             carrying: null,
           },
-          deltas: [{ factoryId: factory.id, output: { [outputItem]: 1 } }],
+          deltas: [],
         };
       }
       return { worker: { ...decayed, position: r.pos }, deltas: [] };
@@ -184,6 +286,68 @@ function stepInnerWorker(w: Worker, factory: FactoryInstance): WorkerStepResult 
     default:
       return { worker: decayed, deltas: [] };
   }
+}
+
+/**
+ * Tries to find a source (terrain or factory) for any item in the given
+ * shortfall list, in order. Returns a WorkerStepResult with the worker
+ * dispatched to that source, or null if nothing is currently fetchable.
+ */
+function tryFetchByShortfall(
+  w: Worker,
+  factory: FactoryInstance,
+  shortfall: { item: string; remaining: number }[],
+  world: WorldState,
+): WorkerStepResult | null {
+  for (const { item } of shortfall) {
+    const terrainKind = TERRAIN_HARVEST[item];
+    if (terrainKind) {
+      const tile = findNearestTerrainResource(
+        world.seed,
+        terrainKind,
+        Math.floor(w.position.x),
+        Math.floor(w.position.y),
+        WORLD_GRID_TILES,
+        WORLD_GRID_TILES,
+        world.tileResources,
+      );
+      if (tile) {
+        return {
+          worker: {
+            ...w,
+            phase: 'h-to-resource',
+            task: {
+              itemType: item,
+              source: { kind: 'terrain', x: tile.x, y: tile.y },
+            },
+          },
+          deltas: [],
+        };
+      }
+      continue;
+    }
+    const src = findNearestFactorySource(
+      world.factories,
+      w.position.x,
+      w.position.y,
+      item,
+      factory.id,
+    );
+    if (src) {
+      return {
+        worker: {
+          ...w,
+          phase: 'h-to-resource',
+          task: {
+            itemType: item,
+            source: { kind: 'factory', factoryId: src.factoryId, x: src.x, y: src.y },
+          },
+        },
+        deltas: [],
+      };
+    }
+  }
+  return null;
 }
 
 function tryRedirectToFarm(w: Worker, world: WorldState): Worker | null {
@@ -265,7 +429,10 @@ function stepHauler(w: Worker, world: WorldState): WorkerStepResult {
   }
 
   const factoryType = FACTORY_TYPES[factory.typeId];
-  const factoryCenter: Vec2 = { x: factory.worldX + 0.5, y: factory.worldY + 0.5 };
+  const factoryCenter: Vec2 = {
+    x: factory.worldX + (factoryType?.baseFootprint.w ?? 1) / 2,
+    y: factory.worldY + (factoryType?.baseFootprint.h ?? 1) / 2,
+  };
 
   // Demolition phases
   if (w.phase === 'h-going-to-demolish') {
@@ -298,7 +465,7 @@ function stepHauler(w: Worker, world: WorldState): WorkerStepResult {
         };
       }
 
-      // Then site clearing
+      // Then site clearing (just clears the tile; doesn't fund construction)
       if (factory.siteClearing && factory.siteClearing.length > 0) {
         const tile = nearestSiteTile(factory.siteClearing, w.position.x, w.position.y);
         if (tile) {
@@ -316,53 +483,107 @@ function stepHauler(w: Worker, world: WorldState): WorkerStepResult {
         }
       }
 
-      // Then food (only if operational)
+      // Construction has highest priority — until complete, we only fetch
+      // construction materials.
+      if (!factory.construction.complete) {
+        const shortfall = constructionShortfall(factory, factoryType);
+        const fetched = tryFetchByShortfall(w, factory, shortfall, world);
+        if (fetched) return fetched;
+        return { worker: w, deltas: [] };
+      }
+
+      // Upgrade materials — opportunistic. If we can fetch one, do so; else
+      // fall through to food / primary input so production continues.
+      if (factory.pendingUpgrade && !factory.pendingUpgrade.complete) {
+        const fetched = tryFetchByShortfall(w, factory, upgradeShortfall(factory), world);
+        if (fetched) return fetched;
+      }
+
+      // Then food (only once operational). Hauler picks the highest-tier food
+      // available (so workers can earn promotion credit), falling back to lower
+      // tiers, finally to terrain forage as last-resort.
+      const totalFood = Object.values(factory.foodInventory ?? {}).reduce(
+        (s, v) => s + v,
+        0,
+      );
       const wantsFood =
         factory.typeId !== 'farm' &&
         isOperational(factory) &&
-        (factory.foodBuffer ?? 0) < FACTORY_FOOD_THRESHOLD;
+        totalFood < FACTORY_FOOD_THRESHOLD;
       if (wantsFood) {
         const innerWorker = world.workers.find(
           (iw) => iw.role === 'inner' && iw.assignedFactoryId === factory.id,
         );
-        const foodItem = foodForTier(innerWorker?.tier ?? 1);
-        const src = findNearestFoodSource(world.factories, w.position.x, w.position.y, foodItem);
-        if (src && src.factoryId !== factory.id) {
-          return {
-            worker: {
-              ...w,
-              phase: 'h-to-resource',
-              task: {
-                itemType: foodItem,
-                source: { kind: 'factory', factoryId: src.factoryId, x: src.x, y: src.y },
+        const tier = innerWorker?.tier ?? 1;
+        const foodPriority = acceptedFoodsForTier(tier);
+        for (const item of foodPriority) {
+          const src = findNearestFoodSource(world.factories, w.position.x, w.position.y, item);
+          if (src && src.factoryId !== factory.id) {
+            return {
+              worker: {
+                ...w,
+                phase: 'h-to-resource',
+                task: {
+                  itemType: item,
+                  source: { kind: 'factory', factoryId: src.factoryId, x: src.x, y: src.y },
+                },
               },
-            },
-            deltas: [],
-          };
+              deltas: [],
+            };
+          }
+          // Fallback: terrain food (only the literal 'food' item is on terrain).
+          const terrainKind = TERRAIN_HARVEST[item];
+          if (terrainKind) {
+            const tile = findNearestTerrainResource(
+              world.seed,
+              terrainKind,
+              Math.floor(w.position.x),
+              Math.floor(w.position.y),
+              WORLD_GRID_TILES,
+              WORLD_GRID_TILES,
+              world.tileResources,
+            );
+            if (tile) {
+              return {
+                worker: {
+                  ...w,
+                  phase: 'h-to-resource',
+                  task: {
+                    itemType: item,
+                    source: { kind: 'terrain', x: tile.x, y: tile.y },
+                  },
+                },
+                deltas: [],
+              };
+            }
+          }
         }
       }
 
-      // Then primary input (operational or construction)
+      // Then primary input (factory is operational)
       const primaryInput = factoryType?.primaryInput;
       if (!primaryInput) return { worker: w, deltas: [] };
 
       if (primaryInput.from === 'terrain') {
-        const tree = findNearestTree(
+        const terrainKind = TERRAIN_HARVEST[primaryInput.item];
+        if (!terrainKind) return { worker: w, deltas: [] };
+        const tile = findNearestTerrainResource(
           world.seed,
+          terrainKind,
           Math.floor(w.position.x),
           Math.floor(w.position.y),
           WORLD_GRID_TILES,
           WORLD_GRID_TILES,
-          world.clearedTiles,
+          world.tileResources,
         );
-        if (!tree) return { worker: w, deltas: [] };
+        if (!tile) return { worker: w, deltas: [] };
         return {
           worker: {
             ...w,
             phase: 'h-to-resource',
             task: {
               itemType: primaryInput.item,
-              source: { kind: 'terrain', x: tree.x, y: tree.y },
+              source: { kind: 'terrain', x: tile.x, y: tile.y },
             },
           },
           deltas: [],
@@ -433,7 +654,6 @@ function stepHauler(w: Worker, world: WorldState): WorkerStepResult {
             {
               factoryId: task.source.targetFactoryId,
               siteClearedTile: { x: task.source.x, y: task.source.y },
-              construction: 1,
             },
           ],
         };
@@ -448,6 +668,12 @@ function stepHauler(w: Worker, world: WorldState): WorkerStepResult {
           return { worker: { ...w, task: null, phase: 'h-idle' }, deltas: [] };
         }
         deltas.push({ factoryId: fId, output: { [item]: -1 } });
+      } else if (task.source.kind === 'terrain') {
+        // Decrement the terrain tile's yield by 1 (deplete on harvest).
+        deltas.push({
+          factoryId: factory.id,
+          terrainHarvested: { x: task.source.x, y: task.source.y },
+        });
       }
       return {
         worker: { ...w, carrying: item, phase: 'h-to-factory' },
@@ -455,7 +681,8 @@ function stepHauler(w: Worker, world: WorldState): WorkerStepResult {
       };
     }
     case 'h-to-factory': {
-      const r = moveTowards(w.position, factoryCenter, OUTER_SPEED);
+      const dock = factoryDockPos(factory, 'W');
+      const r = moveTowards(w.position, dock, OUTER_SPEED);
       if (r.reached) {
         return {
           worker: { ...w, position: r.pos, phase: 'h-delivering', phaseTicks: DELIVER_TICKS },
@@ -469,15 +696,19 @@ function stepHauler(w: Worker, world: WorldState): WorkerStepResult {
         return { worker: { ...w, phaseTicks: w.phaseTicks - 1 }, deltas: [] };
       }
       const carriedItem = w.carrying ?? factoryType?.primaryInput?.item ?? '';
-      const isFoodDelivery =
-        w.task?.itemType !== undefined
-          ? w.task.itemType === foodForTier(1) || w.task.itemType === foodForTier(2)
-          : carriedItem === 'food' || carriedItem === 'bread';
       let delivery: FactoryDelta;
-      if (isFoodDelivery) {
-        delivery = { factoryId: factory.id, foodBuffer: 1 };
-      } else if (!factory.construction.complete) {
-        delivery = { factoryId: factory.id, construction: 1 };
+      if (isConstructionMaterialNeeded(factory, factoryType, carriedItem)) {
+        delivery = {
+          factoryId: factory.id,
+          constructionDelivered: { [carriedItem]: 1 },
+        };
+      } else if (isUpgradeMaterialNeeded(factory, carriedItem)) {
+        delivery = {
+          factoryId: factory.id,
+          upgradeDelivered: { [carriedItem]: 1 },
+        };
+      } else if (isFoodItem(carriedItem)) {
+        delivery = { factoryId: factory.id, foodInventoryDelta: { [carriedItem]: 1 } };
       } else {
         delivery = { factoryId: factory.id, input: { [carriedItem]: 1 } };
       }
@@ -552,12 +783,17 @@ export function stepWorld(world: WorldState): WorldState {
     {
       input: Record<string, number>;
       output: Record<string, number>;
-      construction: number;
-      foodBuffer: number;
-      clearedTiles: { x: number; y: number }[];
+      constructionDelivered: Record<string, number>;
+      upgradeDelivered: Record<string, number>;
+      foodInventoryDelta: Record<string, number>;
+      siteClearedTiles: { x: number; y: number }[];
       demolishProgress: number;
     }
   >();
+  /** Tiles harvested this tick — each one decrements the tile's yield by 1. */
+  const harvestedTiles: { x: number; y: number }[] = [];
+  /** Tiles cleared this tick (site-clearing) — yield set to 0. */
+  const fullyDepletedTiles: { x: number; y: number }[] = [];
 
   const aggregate = (delta: FactoryDelta) => {
     const existing =
@@ -565,9 +801,10 @@ export function stepWorld(world: WorldState): WorldState {
       {
         input: {},
         output: {},
-        construction: 0,
-        foodBuffer: 0,
-        clearedTiles: [],
+        constructionDelivered: {},
+        upgradeDelivered: {},
+        foodInventoryDelta: {},
+        siteClearedTiles: [],
         demolishProgress: 0,
       };
     if (delta.input) {
@@ -580,9 +817,26 @@ export function stepWorld(world: WorldState): WorldState {
         existing.output[k] = (existing.output[k] ?? 0) + v;
       }
     }
-    if (delta.construction) existing.construction += delta.construction;
-    if (delta.foodBuffer) existing.foodBuffer += delta.foodBuffer;
-    if (delta.siteClearedTile) existing.clearedTiles.push(delta.siteClearedTile);
+    if (delta.constructionDelivered) {
+      for (const [k, v] of Object.entries(delta.constructionDelivered)) {
+        existing.constructionDelivered[k] = (existing.constructionDelivered[k] ?? 0) + v;
+      }
+    }
+    if (delta.upgradeDelivered) {
+      for (const [k, v] of Object.entries(delta.upgradeDelivered)) {
+        existing.upgradeDelivered[k] = (existing.upgradeDelivered[k] ?? 0) + v;
+      }
+    }
+    if (delta.foodInventoryDelta) {
+      for (const [k, v] of Object.entries(delta.foodInventoryDelta)) {
+        existing.foodInventoryDelta[k] = (existing.foodInventoryDelta[k] ?? 0) + v;
+      }
+    }
+    if (delta.siteClearedTile) {
+      existing.siteClearedTiles.push(delta.siteClearedTile);
+      fullyDepletedTiles.push(delta.siteClearedTile);
+    }
+    if (delta.terrainHarvested) harvestedTiles.push(delta.terrainHarvested);
     if (delta.demolishProgress) existing.demolishProgress += delta.demolishProgress;
     factoryDeltas.set(delta.factoryId, existing);
   };
@@ -612,16 +866,20 @@ export function stepWorld(world: WorldState): WorldState {
     for (const d of result.deltas) aggregate(d);
   }
 
-  if (newTick % FARM_PRODUCTION_PERIOD === 0) {
-    for (const f of dispatched.factories) {
-      if (f.typeId === 'farm') {
-        aggregate({ factoryId: f.id, output: { food: 1 } });
-      }
+  // Farms produce grain on a per-tier cadence. Tier-1: every FARM_GRAIN_PERIOD
+  // ticks; higher tiers fire faster via tierProductionMultiplier.
+  for (const f of dispatched.factories) {
+    if (f.typeId !== 'farm') continue;
+    if (!f.construction.complete) continue;
+    if (f.demolish || f.siteClearing.length > 0) continue;
+    const mult = BALANCE.farm.tierProductionMultiplier[f.factoryTier] ?? 1;
+    const period = Math.max(1, Math.floor(FARM_GRAIN_PERIOD / mult));
+    if (newTick % period === 0) {
+      aggregate({ factoryId: f.id, output: { grain: 1 } });
     }
   }
 
   const removedFactoryIds = new Set<string>();
-  const newlyClearedTiles: { x: number; y: number }[] = [];
 
   const factoriesAfterDelta = dispatched.factories.map((f) => {
     const delta = factoryDeltas.get(f.id);
@@ -635,21 +893,55 @@ export function stepWorld(world: WorldState): WorldState {
       newOutput[k] = Math.max(0, (newOutput[k] ?? 0) + v);
     }
     let construction = f.construction;
-    if (delta.construction > 0 && !construction.complete) {
-      const cost = FACTORY_TYPES[f.typeId]?.constructionCost?.amount ?? 0;
-      const received = construction.received + delta.construction;
-      construction = {
-        received: Math.min(received, cost),
-        complete: received >= cost,
-      };
+    if (!construction.complete && Object.keys(delta.constructionDelivered).length > 0) {
+      const required = FACTORY_TYPES[f.typeId]?.constructionCost?.resources ?? {};
+      const newDelivered = { ...construction.delivered };
+      for (const [item, amt] of Object.entries(delta.constructionDelivered)) {
+        const cap = required[item] ?? 0;
+        if (cap <= 0) continue;
+        newDelivered[item] = Math.min(cap, (newDelivered[item] ?? 0) + amt);
+      }
+      const isComplete = Object.entries(required).every(
+        ([item, amt]) => (newDelivered[item] ?? 0) >= amt,
+      );
+      construction = { delivered: newDelivered, complete: isComplete };
     }
-    let foodBuffer = f.foodBuffer ?? 0;
-    if (delta.foodBuffer) foodBuffer = Math.max(0, foodBuffer + delta.foodBuffer);
+    let pendingUpgrade = f.pendingUpgrade;
+    let factoryTier = f.factoryTier;
+    if (
+      pendingUpgrade &&
+      !pendingUpgrade.complete &&
+      Object.keys(delta.upgradeDelivered).length > 0
+    ) {
+      const required = (f.typeId === 'farm' ? BALANCE.farmUpgrade[factoryTier + 1] : null) ?? {};
+      const newDelivered = { ...pendingUpgrade.delivered };
+      for (const [item, amt] of Object.entries(delta.upgradeDelivered)) {
+        const cap = required[item] ?? 0;
+        if (cap <= 0) continue;
+        newDelivered[item] = Math.min(cap, (newDelivered[item] ?? 0) + amt);
+      }
+      const isComplete = Object.entries(required).every(
+        ([item, amt]) => (newDelivered[item] ?? 0) >= amt,
+      );
+      if (isComplete) {
+        // Upgrade applies — bump tier, clear pending state.
+        factoryTier = factoryTier + 1;
+        pendingUpgrade = null;
+      } else {
+        pendingUpgrade = { delivered: newDelivered, complete: false };
+      }
+    }
+    let foodInventory = f.foodInventory ?? {};
+    if (Object.keys(delta.foodInventoryDelta).length > 0) {
+      foodInventory = { ...foodInventory };
+      for (const [k, v] of Object.entries(delta.foodInventoryDelta)) {
+        foodInventory[k] = Math.max(0, (foodInventory[k] ?? 0) + v);
+      }
+    }
 
     let siteClearing = f.siteClearing ?? [];
-    if (delta.clearedTiles.length > 0) {
-      for (const c of delta.clearedTiles) newlyClearedTiles.push(c);
-      const cleared = new Set(delta.clearedTiles.map((c) => `${c.x},${c.y}`));
+    if (delta.siteClearedTiles.length > 0) {
+      const cleared = new Set(delta.siteClearedTiles.map((c) => `${c.x},${c.y}`));
       siteClearing = siteClearing.filter((t) => !cleared.has(`${t.x},${t.y}`));
     }
 
@@ -669,25 +961,19 @@ export function stepWorld(world: WorldState): WorldState {
       inputBuffers: newInput,
       outputBuffers: newOutput,
       construction,
-      foodBuffer,
+      foodInventory,
       siteClearing,
       demolish,
+      pendingUpgrade,
+      factoryTier,
     };
   });
-
-  const innerTierByFactory = new Map<string, number>();
-  for (const w of newWorkers) {
-    if (w.role === 'inner' && w.assignedFactoryId) {
-      innerTierByFactory.set(w.assignedFactoryId, w.tier);
-    }
-  }
 
   const factoriesAfterMachines = factoriesAfterDelta.map((f) => {
     if (removedFactoryIds.has(f.id) || !f.machines || f.machines.length === 0) return f;
     if (f.demolish || !f.construction.complete || f.siteClearing.length > 0) {
       return f;
     }
-    const innerTier = innerTierByFactory.get(f.id) ?? 1;
     let inputBuffers = f.inputBuffers;
     let outputBuffers = f.outputBuffers;
     let bufferDirty = false;
@@ -711,12 +997,24 @@ export function stepWorld(world: WorldState): WorldState {
 
       const recipe = type.recipe;
       const requiredTier = type.requiredWorkerTier ?? 1;
-      if (innerTier < requiredTier) {
-        // Worker tier insufficient — stall machine
+      // Count qualified workers assigned to this specific machine.
+      const stations = machineStations(type);
+      let qualifiedWorkers = 0;
+      for (const w of newWorkers) {
+        if (w.role !== 'inner') continue;
+        if (w.assignedFactoryId !== f.id) continue;
+        if (w.targetMachineId !== m.id) continue;
+        if (w.energy <= 0) continue;
+        if (w.tier < requiredTier) continue;
+        qualifiedWorkers++;
+      }
+      const throughput = Math.min(stations, qualifiedWorkers);
+      if (throughput <= 0) {
+        // No qualified worker — stall machine
         return { ...m, cycleProgress: Math.min(m.cycleProgress, recipe.ticksPerCycle) };
       }
 
-      const nextCycle = m.cycleProgress + 1;
+      const nextCycle = m.cycleProgress + throughput;
       if (nextCycle < recipe.ticksPerCycle) {
         return { ...m, cycleProgress: nextCycle };
       }
@@ -766,19 +1064,31 @@ export function stepWorld(world: WorldState): WorldState {
             return { ...w, assignedFactoryId: null, phase: 'h-idle' as const, task: null, carrying: null };
           });
 
-  const newClearedTiles =
-    newlyClearedTiles.length === 0
-      ? dispatched.clearedTiles
-      : {
-          ...dispatched.clearedTiles,
-          ...Object.fromEntries(newlyClearedTiles.map((c) => [`${c.x},${c.y}`, true as const])),
-        };
+  // Apply terrain harvest decrements + site-clearing depletions to tileResources.
+  let newTileResources: Record<string, number> = dispatched.tileResources;
+  if (harvestedTiles.length > 0 || fullyDepletedTiles.length > 0) {
+    newTileResources = { ...dispatched.tileResources };
+    for (const t of harvestedTiles) {
+      const key = `${t.x},${t.y}`;
+      const existing = newTileResources[key];
+      if (existing !== undefined) {
+        newTileResources[key] = Math.max(0, existing - 1);
+      } else {
+        const terr = getTerrainAt(dispatched.seed, t.x, t.y);
+        const def = terr ? defaultTileYield(terr) : 0;
+        newTileResources[key] = Math.max(0, def - 1);
+      }
+    }
+    for (const t of fullyDepletedTiles) {
+      newTileResources[`${t.x},${t.y}`] = 0;
+    }
+  }
 
   return {
     ...dispatched,
     tick: newTick,
     workers: finalWorkers,
     factories: survivingFactories,
-    clearedTiles: newClearedTiles,
+    tileResources: newTileResources,
   };
 }

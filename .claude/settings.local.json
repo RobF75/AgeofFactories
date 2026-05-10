@@ -7,10 +7,10 @@
       "Bash(pnpm install *)",
       "Bash(pnpm typecheck *)",
       "Bash(pnpm lint *)",
+      "Bash(pnpm --filter @aof/client typecheck)",
+      "Bash(pnpm build *)",
       "Bash(pnpm exec *)",
-      "Bash(echo \"exit: $?\")",
-      "Bash(echo \"EXIT=$?\")",
-      "Bash(grep -E \"_SW\\\\.png$\")"
+      "Bash(echo \"EXIT=$?\")"
     ]
   }
 }

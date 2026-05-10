@@ -1,5 +1,8 @@
-import { TIER_FOOD, totalFoodByItem } from '@aof/shared';
+import { acceptedFoodsForTier, totalFoodByItem } from '@aof/shared';
 import { useGameStore } from '../state/gameStore.js';
+
+/** Items that can sustain a tier-1 hauler (used for the hire-cost gate). */
+const SUSTENANCE_ITEMS = ['grain', 'food'];
 
 export function WorkersPanel() {
   const view = useGameStore((s) => s.view);
@@ -10,16 +13,21 @@ export function WorkersPanel() {
 
   if (view.kind !== 'world' || !factories || !workers) return null;
 
+  // Show stock for every food item across all tiers, deduped, in priority order.
+  const allFoodItems = new Set<string>();
+  for (let t = 1; t <= 3; t++) {
+    for (const item of acceptedFoodsForTier(t)) allFoodItems.add(item);
+  }
   const foodByItem: Record<string, number> = {};
-  for (const item of Object.values(TIER_FOOD)) {
+  for (const item of allFoodItems) {
     foodByItem[item] = totalFoodByItem(factories, item);
   }
-  const tier1Food = foodByItem['food'] ?? 0;
+  const sustenanceAvailable = SUSTENANCE_ITEMS.some((i) => (foodByItem[i] ?? 0) >= 1);
   const haulers = workers.filter((w) => w.role === 'hauler');
   const total = haulers.length;
   const idle = haulers.filter((w) => w.assignedFactoryId === null).length;
   const working = total - idle;
-  const canHire = tier1Food >= 1;
+  const canHire = sustenanceAvailable;
   const canFire = idle >= 1;
 
   return (
@@ -73,7 +81,7 @@ export function WorkersPanel() {
             fontSize: 13,
           }}
         >
-          Hire (1 food)
+          Hire (1 grain/food)
         </button>
         <button
           type="button"

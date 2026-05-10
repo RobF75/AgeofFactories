@@ -8,11 +8,13 @@ export interface FactoryType {
   isCritical: boolean;
   primaryInput?: { item: string; from: 'terrain' | 'factory' };
   primaryOutput?: { item: string };
-  constructionCost?: { amount: number };
+  /** Resources required to construct one instance, keyed by item type. */
+  constructionCost?: { resources: Record<string, number> };
 }
 
 export interface FactoryConstruction {
-  received: number;
+  /** Construction materials delivered so far, keyed by item type. */
+  delivered: Record<string, number>;
   complete: boolean;
 }
 
@@ -35,10 +37,18 @@ export interface FactoryInstance {
   currentRecipeId: string | null;
   construction: FactoryConstruction;
   desiredWorkers: number;
-  foodBuffer: number;
+  /** Food kept in this factory's pantry, keyed by item type (e.g. food/grain/bread). */
+  foodInventory: Record<string, number>;
   siteClearing: { x: number; y: number }[];
   demolish: FactoryDemolish | null;
   machines: Machine[];
+  /** 1 = base. Higher tiers unlock faster production / new recipes. */
+  factoryTier: number;
+  /**
+   * If non-null, this factory is undergoing a tier upgrade. Haulers gather the
+   * required materials, mirroring the initial construction flow.
+   */
+  pendingUpgrade: FactoryConstruction | null;
 }
 
 export interface Allocations {

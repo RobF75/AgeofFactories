@@ -1,10 +1,8 @@
-import { useState } from 'react';
 import {
+  BALANCE,
   FACTORY_TYPES,
-  MACHINE_TYPES,
   MAX_WORKER_TIER,
   MEALS_TO_PROMOTE,
-  compatibleMachineTypes,
   countTreesInFootprint,
   foodForTier,
 } from '@aof/shared';
@@ -53,8 +51,9 @@ export function FactoryInfoPanel() {
   const setDesiredWorkers = useGameStore((s) => s.setDesiredWorkers);
   const beginDemolish = useGameStore((s) => s.beginDemolish);
   const cancelDemolish = useGameStore((s) => s.cancelDemolish);
-  const buildMachine = useGameStore((s) => s.buildMachine);
   const promoteInnerWorker = useGameStore((s) => s.promoteInnerWorker);
+  const beginFarmUpgrade = useGameStore((s) => s.beginFarmUpgrade);
+  const cancelFarmUpgrade = useGameStore((s) => s.cancelFarmUpgrade);
   const innerWorker = useGameStore((s) =>
     selectedFactoryId
       ? (s.world?.workers.find(
@@ -62,8 +61,6 @@ export function FactoryInfoPanel() {
         ) ?? null)
       : null,
   );
-  const [pickedMachineTypeId, setPickedMachineTypeId] = useState<string>('');
-
   if (view.kind !== 'world' || !factory) return null;
   const type = FACTORY_TYPES[factory.typeId];
   if (!type) return null;
@@ -72,9 +69,15 @@ export function FactoryInfoPanel() {
   const isDemolishing = factory.demolish !== null;
   const isSiteClearing = factory.siteClearing.length > 0;
   const isConstructing = !factory.construction.complete && !isSiteClearing;
-  const cost = type.constructionCost?.amount ?? 0;
-  const received = factory.construction.received;
-  const constructionPct = cost > 0 ? Math.round((received / cost) * 100) : 100;
+  const constructionRequired = type.constructionCost?.resources ?? {};
+  const constructionDelivered = factory.construction.delivered;
+  let totalReq = 0;
+  let totalGot = 0;
+  for (const [item, amt] of Object.entries(constructionRequired)) {
+    totalReq += amt;
+    totalGot += Math.min(amt, constructionDelivered[item] ?? 0);
+  }
+  const constructionPct = totalReq > 0 ? Math.round((totalGot / totalReq) * 100) : 100;
   const totalTrees = countTreesInFootprint(
     seed,
     factory.worldX,
@@ -154,8 +157,19 @@ export function FactoryInfoPanel() {
             Under construction — {constructionPct}%
           </div>
           <ProgressBar pct={constructionPct} color="#e0c060" />
-          <div style={{ fontSize: 12, color: '#7a8294', marginTop: 4 }}>
-            {received} / {cost} {type.primaryInput?.item ?? 'units'} delivered
+          <div style={{ fontSize: 12, color: '#7a8294', marginTop: 6, display: 'flex', flexDirection: 'column', gap: 2 }}>
+            {Object.entries(constructionRequired).map(([item, amt]) => {
+              const got = Math.min(amt, constructionDelivered[item] ?? 0);
+              const done = got >= amt;
+              return (
+                <div key={item} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span>{item}</span>
+                  <span style={{ color: done ? '#a4d97a' : '#e0c060' }}>
+                    {got} / {amt}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -186,26 +200,37 @@ export function FactoryInfoPanel() {
               </span>
             </div>
           )}
-          {!isFarm && (
-            <div>
-              <span style={{ color: '#7a8294' }}>
-                food buffer ({foodForTier(innerWorker?.tier ?? 1)}):{' '}
-              </span>
-              <span
-                style={{
-                  color: factory.foodBuffer < 1 ? '#ff5555' : '#e0c060',
-                  fontWeight: 600,
-                }}
-              >
-                {factory.foodBuffer ?? 0}
-              </span>
-              {factory.foodBuffer < 1 && (
-                <span style={{ color: '#ff5555', fontSize: 11, marginLeft: 6 }}>
-                  inner worker hungry
+          {!isFarm && (() => {
+            const inv = factory.foodInventory ?? {};
+            const total = Object.values(inv).reduce((s, v) => s + v, 0);
+            const breakdown = Object.entries(inv)
+              .filter(([, v]) => v > 0)
+              .map(([k, v]) => `${v} ${k}`)
+              .join(', ');
+            return (
+              <div>
+                <span style={{ color: '#7a8294' }}>food pantry: </span>
+                <span
+                  style={{
+                    color: total < 1 ? '#ff5555' : '#e0c060',
+                    fontWeight: 600,
+                  }}
+                >
+                  {total}
                 </span>
-              )}
-            </div>
-          )}
+                {breakdown && (
+                  <span style={{ color: '#7a8294', fontSize: 11, marginLeft: 6 }}>
+                    ({breakdown})
+                  </span>
+                )}
+                {total < 1 && (
+                  <span style={{ color: '#ff5555', fontSize: 11, marginLeft: 6 }}>
+                    inner worker hungry
+                  </span>
+                )}
+              </div>
+            );
+          })()}
         </div>
       )}
 
@@ -225,36 +250,38 @@ export function FactoryInfoPanel() {
           >
             <span>tier {innerWorker.tier}</span>
             <span style={{ color: '#7a8294' }}>·</span>
-            <span style={{ color: '#a4d97a' }}>
-              {innerWorker.mealsEaten}/{MEALS_TO_PROMOTE} meals
-            </span>
-            <span style={{ color: '#7a8294', fontSize: 11 }}>
-              (eats {foodForTier(innerWorker.tier)})
-            </span>
+            {innerWorker.tier < MAX_WORKER_TIER ? (
+              <span style={{ color: '#a4d97a' }}>
+                {innerWorker.nextTierMealsEaten}/{MEALS_TO_PROMOTE}{' '}
+                {foodForTier(innerWorker.tier + 1)}
+              </span>
+            ) : (
+              <span style={{ color: '#7a8294' }}>{innerWorker.mealsEaten} meals (max tier)</span>
+            )}
             {innerWorker.tier < MAX_WORKER_TIER && (
               <button
                 type="button"
                 onClick={() => promoteInnerWorker(factory.id)}
-                disabled={innerWorker.mealsEaten < MEALS_TO_PROMOTE}
+                disabled={innerWorker.nextTierMealsEaten < MEALS_TO_PROMOTE}
                 style={{
                   marginLeft: 'auto',
                   padding: '0.2rem 0.5rem',
                   background:
-                    innerWorker.mealsEaten >= MEALS_TO_PROMOTE ? '#3a4a6a' : '#252830',
+                    innerWorker.nextTierMealsEaten >= MEALS_TO_PROMOTE ? '#3a4a6a' : '#252830',
                   color:
-                    innerWorker.mealsEaten >= MEALS_TO_PROMOTE ? '#e6e6e6' : '#5a6378',
+                    innerWorker.nextTierMealsEaten >= MEALS_TO_PROMOTE ? '#e6e6e6' : '#5a6378',
                   border: `1px solid ${
-                    innerWorker.mealsEaten >= MEALS_TO_PROMOTE ? '#5a6a8a' : '#3a4258'
+                    innerWorker.nextTierMealsEaten >= MEALS_TO_PROMOTE ? '#5a6a8a' : '#3a4258'
                   }`,
                   borderRadius: 3,
                   cursor:
-                    innerWorker.mealsEaten >= MEALS_TO_PROMOTE ? 'pointer' : 'not-allowed',
+                    innerWorker.nextTierMealsEaten >= MEALS_TO_PROMOTE ? 'pointer' : 'not-allowed',
                   fontSize: 12,
                 }}
                 title={
-                  innerWorker.mealsEaten >= MEALS_TO_PROMOTE
-                    ? `Promote to tier ${innerWorker.tier + 1} (will eat ${foodForTier(innerWorker.tier + 1)})`
-                    : `Needs ${MEALS_TO_PROMOTE - innerWorker.mealsEaten} more meals`
+                  innerWorker.nextTierMealsEaten >= MEALS_TO_PROMOTE
+                    ? `Promote to tier ${innerWorker.tier + 1}`
+                    : `Needs ${MEALS_TO_PROMOTE - innerWorker.nextTierMealsEaten} more ${foodForTier(innerWorker.tier + 1)}`
                 }
               >
                 Promote ↑
@@ -303,19 +330,17 @@ export function FactoryInfoPanel() {
 
       {isFarm && !isDemolishing && (
         <div style={{ marginTop: 12, fontSize: 11, color: '#5a6378' }}>
-          Farms produce food on their own. Workers visit to eat when hungry.
+          Farms produce grain on their own. Higher tiers produce faster.
         </div>
       )}
 
-      {!isFarm && !isDemolishing && !isSiteClearing && !isConstructing && (
-        <Workshop
+      {isFarm && !isDemolishing && !isSiteClearing && !isConstructing && (
+        <FarmUpgradePanel
           factoryId={factory.id}
-          factoryTypeId={factory.typeId}
-          machines={factory.machines}
-          inputBuffers={factory.inputBuffers}
-          pickedMachineTypeId={pickedMachineTypeId}
-          setPickedMachineTypeId={setPickedMachineTypeId}
-          buildMachine={buildMachine}
+          factoryTier={factory.factoryTier}
+          pendingUpgrade={factory.pendingUpgrade}
+          onBegin={() => beginFarmUpgrade(factory.id)}
+          onCancel={() => cancelFarmUpgrade(factory.id)}
         />
       )}
 
@@ -364,149 +389,112 @@ export function FactoryInfoPanel() {
   );
 }
 
-function Workshop({
+function FarmUpgradePanel({
   factoryId,
-  factoryTypeId,
-  machines,
-  inputBuffers,
-  pickedMachineTypeId,
-  setPickedMachineTypeId,
-  buildMachine,
+  factoryTier,
+  pendingUpgrade,
+  onBegin,
+  onCancel,
 }: {
   factoryId: string;
-  factoryTypeId: string;
-  machines: import('@aof/shared').Machine[];
-  inputBuffers: Record<string, number>;
-  pickedMachineTypeId: string;
-  setPickedMachineTypeId: (id: string) => void;
-  buildMachine: (factoryId: string, typeId: string) => boolean;
+  factoryTier: number;
+  pendingUpgrade: import('@aof/shared').FactoryConstruction | null;
+  onBegin: () => void;
+  onCancel: () => void;
 }) {
-  const compatible = compatibleMachineTypes(factoryTypeId);
-  const effectivePicked =
-    pickedMachineTypeId && compatible.some((c) => c.id === pickedMachineTypeId)
-      ? pickedMachineTypeId
-      : (compatible[0]?.id ?? '');
-  const pickedType = effectivePicked ? (MACHINE_TYPES[effectivePicked] ?? null) : null;
-  const canBuild =
-    pickedType !== null &&
-    Object.entries(pickedType.buildCost).every(
-      ([item, amt]) => (inputBuffers[item] ?? 0) >= amt,
+  void factoryId;
+  const targetTier = factoryTier + 1;
+  const cost = BALANCE.farmUpgrade[targetTier];
+  if (pendingUpgrade && cost) {
+    const totalReq = Object.values(cost).reduce((s, v) => s + v, 0);
+    const totalGot = Object.entries(cost).reduce(
+      (s, [k, amt]) => s + Math.min(amt, pendingUpgrade.delivered[k] ?? 0),
+      0,
     );
-
+    const pct = totalReq > 0 ? Math.round((totalGot / totalReq) * 100) : 100;
+    return (
+      <div style={{ marginTop: 14 }}>
+        <div style={{ fontSize: 12, color: '#e0c060', marginBottom: 4 }}>
+          Upgrading to tier {targetTier} — {pct}%
+        </div>
+        <ProgressBar pct={pct} color="#e0c060" />
+        <div
+          style={{
+            fontSize: 12,
+            color: '#7a8294',
+            marginTop: 6,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2,
+          }}
+        >
+          {Object.entries(cost).map(([item, amt]) => {
+            const got = Math.min(amt, pendingUpgrade.delivered[item] ?? 0);
+            const done = got >= amt;
+            return (
+              <div key={item} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>{item}</span>
+                <span style={{ color: done ? '#a4d97a' : '#e0c060' }}>
+                  {got} / {amt}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          onClick={onCancel}
+          style={{
+            marginTop: 6,
+            padding: '0.3rem 0.6rem',
+            background: '#2a3042',
+            color: '#e0c060',
+            border: '1px solid #3a4258',
+            borderRadius: 4,
+            cursor: 'pointer',
+            fontSize: 12,
+          }}
+        >
+          Cancel upgrade
+        </button>
+      </div>
+    );
+  }
+  if (!cost) {
+    return (
+      <div style={{ marginTop: 12, fontSize: 11, color: '#5a6378' }}>
+        Tier {factoryTier} (max).
+      </div>
+    );
+  }
   return (
     <div style={{ marginTop: 14 }}>
-      <div style={{ fontSize: 12, color: '#7a8294', marginBottom: 4 }}>WORKSHOP</div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 8 }}>
-        {machines.length === 0 && (
-          <div style={{ fontSize: 11, color: '#5a6378' }}>No machines yet.</div>
-        )}
-        {machines.map((m) => {
-          const t = MACHINE_TYPES[m.typeId];
-          if (!t) return null;
-          const isBuilding = m.status === 'building';
-          const pct = isBuilding
-            ? Math.round((m.buildProgress / t.buildTicks) * 100)
-            : Math.round((m.cycleProgress / t.recipe.ticksPerCycle) * 100);
-          const stalled =
-            !isBuilding && m.cycleProgress >= t.recipe.ticksPerCycle;
-          return (
-            <div
-              key={m.id}
-              style={{
-                fontSize: 12,
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                padding: '4px 6px',
-                background: 'rgba(255,255,255,0.03)',
-                borderRadius: 3,
-              }}
-            >
-              <span style={{ flex: 1 }}>{t.name}</span>
-              <span
-                style={{
-                  color: isBuilding
-                    ? '#e0c060'
-                    : stalled
-                      ? '#ff7a7a'
-                      : '#a4d97a',
-                  fontWeight: 600,
-                }}
-              >
-                {isBuilding ? `building ${pct}%` : stalled ? 'stalled (no input)' : `${pct}%`}
-              </span>
-            </div>
-          );
-        })}
+      <div style={{ fontSize: 12, color: '#7a8294', marginBottom: 4 }}>UPGRADE</div>
+      <button
+        type="button"
+        onClick={onBegin}
+        style={{
+          width: '100%',
+          padding: '0.4rem 0.7rem',
+          background: '#2a4a6a',
+          color: '#e6e6e6',
+          border: '1px solid #3a5a8a',
+          borderRadius: 4,
+          cursor: 'pointer',
+          fontSize: 13,
+        }}
+        title={`Tier ${factoryTier} → ${targetTier}: ${Object.entries(cost)
+          .map(([k, v]) => `${v} ${k}`)
+          .join(', ')}`}
+      >
+        Upgrade to tier {targetTier}
+      </button>
+      <div style={{ fontSize: 11, color: '#7a8294', marginTop: 4 }}>
+        Cost:{' '}
+        {Object.entries(cost)
+          .map(([k, v]) => `${v} ${k}`)
+          .join(', ')}
       </div>
-      {pickedType ? (
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-          <select
-            value={effectivePicked}
-            onChange={(e) => setPickedMachineTypeId(e.target.value)}
-            style={{
-              flex: 1,
-              padding: '0.35rem 0.5rem',
-              background: '#1a1f2c',
-              color: '#e6e6e6',
-              border: '1px solid #2c3344',
-              borderRadius: 4,
-              fontSize: 13,
-            }}
-          >
-            {compatible.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
-          <button
-            type="button"
-            onClick={() => buildMachine(factoryId, effectivePicked)}
-            disabled={!canBuild}
-            title={
-              canBuild
-                ? `Costs ${Object.entries(pickedType.buildCost)
-                    .map(([i, a]) => `${a} ${i}`)
-                    .join(', ')}`
-                : `Needs ${Object.entries(pickedType.buildCost)
-                    .map(([i, a]) => `${a} ${i}`)
-                    .join(', ')} in input buffer`
-            }
-            style={{
-              padding: '0.4rem 0.7rem',
-              background: canBuild ? '#2a4a6a' : '#252830',
-              color: canBuild ? '#e6e6e6' : '#5a6378',
-              border: `1px solid ${canBuild ? '#3a5a8a' : '#3a4258'}`,
-              borderRadius: 4,
-              cursor: canBuild ? 'pointer' : 'not-allowed',
-              fontSize: 13,
-            }}
-          >
-            Build
-          </button>
-        </div>
-      ) : (
-        <div style={{ fontSize: 11, color: '#5a6378' }}>
-          No compatible machine types yet.
-        </div>
-      )}
-      {pickedType && (
-        <div style={{ fontSize: 11, color: '#7a8294', marginTop: 6 }}>
-          Cost:{' '}
-          {Object.entries(pickedType.buildCost)
-            .map(([i, a]) => `${a} ${i}`)
-            .join(', ')}{' '}
-          · build {Math.round(pickedType.buildTicks / 20)}s ·{' '}
-          {Object.entries(pickedType.recipe.inputs)
-            .map(([i, a]) => `${a} ${i}`)
-            .join(', ')}{' '}
-          → {Object.entries(pickedType.recipe.outputs)
-            .map(([i, a]) => `${a} ${i}`)
-            .join(', ')}{' '}
-          per {Math.round(pickedType.recipe.ticksPerCycle / 20)}s
-        </div>
-      )}
     </div>
   );
 }

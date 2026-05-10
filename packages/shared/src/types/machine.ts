@@ -6,6 +6,8 @@ export interface Machine {
   status: MachineStatus;
   buildProgress: number;
   cycleProgress: number;
+  innerX: number;
+  innerY: number;
 }
 
 export interface MachineRecipe {
@@ -23,4 +25,6 @@ export interface MachineType {
   buildTicks: number;
   acceptableInFactoryIds?: string[];
   requiredWorkerTier?: number;
+  /** Max productive workers concurrently. Throughput per tick = min(stations, assignedQualifiedWorkers). */
+  stations?: number;
 }

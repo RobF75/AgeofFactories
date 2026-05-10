@@ -12,6 +12,6 @@ export function createInitialWorld(): WorldState {
       currentEra: 'stone',
     },
     modifiedChunks: [],
-    clearedTiles: {},
+    tileResources: {},
   };
 }

@@ -10,6 +10,7 @@ export * from './world/factoryLayout.js';
 export * from './world/terrain.js';
 export * from './sim/step.js';
 export * from './sim/migrate.js';
+export * from './data/balance.js';
 export * from './data/factoryTypes.js';
 export * from './data/machineTypes.js';
 export * from './data/foodTiers.js';

@@ -39,10 +39,18 @@ export interface Worker {
   phaseTicks: number;
   carrying: string | null;
   task: WorkerTask | null;
+  /** Total meals (any food). Sustains worker across promotion. */
   mealsEaten: number;
+  /** Meals of the next-tier promotion food eaten since last promotion. Only this counter unlocks promotion. */
+  nextTierMealsEaten: number;
+  /** The most recent food this worker ate. Drives speed multiplier (BALANCE.foodSpeed). */
+  lastEaten: string | null;
+  targetMachineId: string | null;
 }
 
-export const MAX_ENERGY = 1200;
-export const HUNGER_THRESHOLD = 300;
-export const MEALS_TO_PROMOTE = 5;
-export const MAX_WORKER_TIER = 2;
+import { BALANCE } from '../data/balance.js';
+
+export const MAX_ENERGY = BALANCE.worker.maxEnergy;
+export const HUNGER_THRESHOLD = BALANCE.worker.hungerThreshold;
+export const MEALS_TO_PROMOTE = BALANCE.worker.mealsToPromote;
+export const MAX_WORKER_TIER = BALANCE.worker.maxTier;

@@ -5,7 +5,9 @@ import {
   HUNGER_THRESHOLD,
   MAX_ENERGY,
   WORLD_GRID_TILES,
+  bayWorldPos,
   effectiveTerrainAt,
+  findBay,
   type FactoryInstance,
   type Worker,
   type WorldState,
@@ -182,7 +184,7 @@ export async function createWorldPixi(container: HTMLElement): Promise<WorldPixi
   let renderedSeed: number | null = null;
   let renderedClearCount = -1;
   const renderTerrain = (world: WorldState) => {
-    const clearCount = Object.keys(world.clearedTiles).length;
+    const clearCount = Object.keys(world.tileResources).length;
     if (world.seed === renderedSeed && clearCount === renderedClearCount) return;
     renderedSeed = world.seed;
     renderedClearCount = clearCount;
@@ -205,7 +207,7 @@ export async function createWorldPixi(container: HTMLElement): Promise<WorldPixi
           sprite.anchor.set(0.5, 0.65);
           sprite.x = c.x;
           sprite.y = c.y;
-          const targetW = t === 'tree' ? ISO_TILE_W * 2 : ISO_TILE_W * 1.2;
+          const targetW = t === 'tree' ? ISO_TILE_W * 2 : t === 'food' ? ISO_TILE_W * 0.8 : ISO_TILE_W * 1.2;
           sprite.scale.set(targetW / sprite.texture.width);
           sprite.zIndex = x + y + 0.5;
           entityLayer.addChild(sprite);
@@ -221,6 +223,10 @@ export async function createWorldPixi(container: HTMLElement): Promise<WorldPixi
             fallback.circle(c.x, c.y, ISO_HH * 0.55);
             fallback.fill({ color: 0x6e7080 });
             fallback.stroke({ width: 1, color: 0x40434f });
+          } else if (t === 'food') {
+            fallback.circle(c.x, c.y, ISO_HH * 0.4);
+            fallback.fill({ color: 0xc4a040 });
+            fallback.stroke({ width: 1, color: 0x6e5a20 });
           }
           fallback.zIndex = x + y + 0.5;
           entityLayer.addChild(fallback);
@@ -309,14 +315,35 @@ export async function createWorldPixi(container: HTMLElement): Promise<WorldPixi
         node.addChild(body);
       }
 
+      // Bay markers (only once construction + clearing finished)
+      if (!isConstructing && !isSiteClearing) {
+        for (const side of ['W', 'E'] as const) {
+          const bay = findBay(f.innerLayout, side);
+          if (!bay) continue;
+          const bp = bayWorldPos(f, type, bay.x, bay.y);
+          const sp = tileToScreen(bp.x, bp.y);
+          const marker = new Graphics();
+          marker.circle(sp.x, sp.y, 5);
+          marker.fill({ color: side === 'W' ? 0x6a9adc : 0xdc9a6a, alpha: 0.95 });
+          marker.stroke({ width: 1, color: 0x000000, alpha: 0.55 });
+          node.addChild(marker);
+        }
+      }
+
       let barRatio: number | null = null;
       let barColor = 0xe0c060;
       if (isDemolishing && f.demolish) {
         barRatio = Math.min(1, f.demolish.progress / f.demolish.total);
         barColor = 0xff5555;
       } else if (isConstructing) {
-        const cost = type.constructionCost?.amount ?? 1;
-        barRatio = Math.min(1, f.construction.received / cost);
+        const required = type.constructionCost?.resources ?? {};
+        let totalReq = 0;
+        let totalGot = 0;
+        for (const [item, amt] of Object.entries(required)) {
+          totalReq += amt;
+          totalGot += Math.min(amt, f.construction.delivered[item] ?? 0);
+        }
+        barRatio = totalReq > 0 ? Math.min(1, totalGot / totalReq) : 1;
         barColor = 0xe0c060;
       }
       if (barRatio !== null) {

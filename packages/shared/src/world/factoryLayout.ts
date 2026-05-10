@@ -1,4 +1,6 @@
+import { defaultMachineTypeFor, MACHINE_TYPES } from '../data/machineTypes.js';
 import type { FactoryInstance, FactoryType, InnerTile } from '../types/factory.js';
+import type { Machine } from '../types/machine.js';
 import type { Worker } from '../types/worker.js';
 import { MAX_ENERGY } from '../types/worker.js';
 
@@ -15,14 +17,26 @@ export function createDefaultInnerLayout(type: FactoryType): InnerTile[][] {
   if (type.id === 'farm') return layout;
 
   const midY = Math.floor(h / 2);
-  const midX = Math.floor(w / 2);
   const midRow = layout[midY];
   if (midRow) {
     midRow[0] = { kind: 'bay', bayType: 'hand', side: 'W' };
-    midRow[midX] = { kind: 'machine', machineId: 'log-mill', recipeId: 'firewood' };
     midRow[w - 1] = { kind: 'bay', bayType: 'hand', side: 'E' };
   }
   return layout;
+}
+
+export function createDefaultMachine(type: FactoryType): Machine | null {
+  const machineTypeId = defaultMachineTypeFor(type.id);
+  if (!machineTypeId || !MACHINE_TYPES[machineTypeId]) return null;
+  return {
+    id: crypto.randomUUID(),
+    typeId: machineTypeId,
+    status: 'operational',
+    buildProgress: MACHINE_TYPES[machineTypeId].buildTicks,
+    cycleProgress: 0,
+    innerX: Math.floor(type.innerGrid.w / 2),
+    innerY: Math.floor(type.innerGrid.h / 2),
+  };
 }
 
 export function findBay(
@@ -40,6 +54,7 @@ export function findBay(
   return null;
 }
 
+/** Legacy lookup used by older code paths. New code iterates `factory.machines`. */
 export function findMachine(layout: InnerTile[][]): { x: number; y: number } | null {
   for (let y = 0; y < layout.length; y++) {
     const row = layout[y];
@@ -52,11 +67,6 @@ export function findMachine(layout: InnerTile[][]): { x: number; y: number } | n
   return null;
 }
 
-/**
- * Map a bay's inner-grid coordinate to its outer-world coordinate.
- * The factory's inner grid is `innerGrid.w x innerGrid.h` tiles spanning
- * a `baseFootprint.w x baseFootprint.h` outer area.
- */
 export function bayWorldPos(
   factory: FactoryInstance,
   type: FactoryType,
@@ -89,6 +99,9 @@ export function createInitialInnerWorker(factoryId: string, factory: FactoryInst
     carrying: null,
     task: null,
     mealsEaten: 0,
+    nextTierMealsEaten: 0,
+    lastEaten: null,
+    targetMachineId: null,
   };
 }
 
@@ -106,5 +119,8 @@ export function createIdleHauler(spawnX: number, spawnY: number): Worker {
     carrying: null,
     task: null,
     mealsEaten: 0,
+    nextTierMealsEaten: 0,
+    lastEaten: null,
+    targetMachineId: null,
   };
 }
